@@ -27,10 +27,10 @@ def access_token():
         file = Path.home() / ".claude" / ".credentials.json"
         stored = file.read_text() if file.is_file() else ""
     if not stored:
-        raise RuntimeError("Claude Code sign-in not found. Sign in to Claude Code first.")
+        raise RuntimeError("Claude Code sign-in not found. Run `claude /login` in Terminal.")
     token = (json.loads(stored).get("claudeAiOauth") or {}).get("accessToken")
     if not token:
-        raise RuntimeError("Claude Code is not signed in with a Claude subscription.")
+        raise RuntimeError("No Claude account sign-in saved for Claude Code. Run `claude /login` in Terminal.")
     return token
 
 
