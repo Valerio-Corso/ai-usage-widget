@@ -70,8 +70,45 @@ private struct UsageSnapshot {
     let resetCreditExpiries: [ResetCreditExpiry]
 }
 
-private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+private struct Provider {
+    let name: String
+    let labelLetters: [String]
+    let script: String
+    let limitID: String
+    let hasResetCredits: Bool
+
+    static let codex = Provider(name: "Codex", labelLetters: ["G", "P", "T"], script: "codex_usage",
+                                limitID: "codex", hasResetCredits: true)
+    static let claude = Provider(name: "Claude", labelLetters: ["C", "L", "A"], script: "claude_usage",
+                                 limitID: "claude", hasResetCredits: false)
+}
+
+private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    private var monitors: [UsageMonitor] = []
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let notifications = UNUserNotificationCenter.current()
+        notifications.delegate = self
+        notifications.requestAuthorization(options: [.alert]) { _, error in
+            if let error {
+                NSLog("Could not request reset credit alert permission: %@", error.localizedDescription)
+            }
+        }
+        monitors = [UsageMonitor(provider: .codex), UsageMonitor(provider: .claude)]
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list])
+    }
+}
+
+private final class UsageMonitor: NSObject {
     private static let resetCreditAlertsKey = "sentResetCreditExpiryAlerts"
+    private let provider: Provider
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let notifications = UNUserNotificationCenter.current()
     private var sentResetCreditAlerts =
@@ -80,14 +117,10 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
     private var refreshing = false
     private var timer: Timer?
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        notifications.delegate = self
-        notifications.requestAuthorization(options: [.alert]) { _, error in
-            if let error {
-                NSLog("Could not request reset credit alert permission: %@", error.localizedDescription)
-            }
-        }
-        setStatusTitle("Codex …")
+    init(provider: Provider) {
+        self.provider = provider
+        super.init()
+        setStatusTitle("\(provider.name) …")
         showMenu(message: "Checking usage…")
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
@@ -99,7 +132,8 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
         guard !refreshing else { return }
         refreshing = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let result = Self.readUsage()
+            guard let provider = self?.provider else { return }
+            let result = Self.readUsage(provider)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.refreshing = false
@@ -108,7 +142,7 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
                     self.showUsage(usage)
                     self.checkResetCreditExpiries(usage.resetCreditExpiries)
                 case let .failure(error):
-                    self.setStatusTitle("Codex ⚠")
+                    self.setStatusTitle("\(self.provider.name) ⚠")
                     self.showMenu(message: error.localizedDescription)
                 }
             }
@@ -135,7 +169,7 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
                   pendingResetCreditAlerts.insert(expiry.id).inserted else { continue }
 
             let content = UNMutableNotificationContent()
-            content.title = "Codex reset credit expiring soon"
+            content.title = "\(provider.name) reset credit expiring soon"
             content.body = "An available reset credit expires \(expiry.formattedDate)."
             let request = UNNotificationRequest(identifier: expiry.id, content: content, trigger: nil)
             notifications.add(request) { [weak self] error in
@@ -155,17 +189,9 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
         }
     }
 
-    func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-    ) {
-        completionHandler([.banner, .list])
-    }
-
-    private static func readUsage() -> Result<UsageSnapshot, Error> {
+    private static func readUsage(_ provider: Provider) -> Result<UsageSnapshot, Error> {
         do {
-            guard let script = Bundle.main.path(forResource: "codex_usage", ofType: "py") else {
+            guard let script = Bundle.main.path(forResource: provider.script, ofType: "py") else {
                 throw UsageError("Bundled usage script is missing")
             }
             let process = Process()
@@ -185,10 +211,10 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
             }
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let limits = json["limits"] as? [String: [String: Any]],
-                  let codex = limits["codex"] ?? limits.values.first else {
-                throw UsageError("No Codex quota was returned")
+                  let limit = limits[provider.limitID] ?? limits.values.first else {
+                throw UsageError("No \(provider.name) quota was returned")
             }
-            let windows = [QuotaWindow(codex["primary"]), QuotaWindow(codex["secondary"])].compactMap { $0 }
+            let windows = [QuotaWindow(limit["primary"]), QuotaWindow(limit["secondary"])].compactMap { $0 }
             guard !windows.isEmpty else { throw UsageError("No usage windows were returned") }
             let resetCreditsAvailable = json["resetCreditsAvailable"] as? Int
             let expiryData = json["resetCreditExpiries"] as? [[String: Any]] ?? []
@@ -218,7 +244,7 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
         let labelAttributes: [NSAttributedString.Key: Any] = [.font: labelFont, .foregroundColor: NSColor.black]
         let periods = windows.map { NSAttributedString(string: $0.compactPeriod, attributes: valueAttributes) }
         let values = windows.map { NSAttributedString(string: $0.remainingText, attributes: valueAttributes) }
-        let letters = ["G", "P", "T"].map { NSAttributedString(string: $0, attributes: labelAttributes) }
+        let letters = provider.labelLetters.map { NSAttributedString(string: $0, attributes: labelAttributes) }
         let labelWidth = ceil(letters.map { $0.size().width }.max() ?? 0)
         let periodWidth = ceil(periods.map { $0.size().width }.max() ?? 0)
         let valueWidth = ceil(NSAttributedString(string: "100%", attributes: valueAttributes).size().width)
@@ -279,7 +305,7 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
         item.button?.title = ""
         item.button?.attributedTitle = NSAttributedString(string: "")
         item.button?.image = image
-        var description = "Codex Usage. "
+        var description = "\(provider.name) Usage. "
         if let nextReset {
             let formatter = DateFormatter()
             formatter.dateStyle = .medium
@@ -294,7 +320,7 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
 
         let menu = NSMenu()
         menu.minimumWidth = 270
-        addInformation(NSAttributedString(string: "Codex Usage", attributes: [
+        addInformation(NSAttributedString(string: "\(provider.name) Usage", attributes: [
             .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
             .foregroundColor: NSColor.labelColor
         ]), to: menu)
@@ -315,24 +341,26 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
                 .foregroundColor: NSColor.secondaryLabelColor
             ]), to: menu)
         }
-        let resetCreditsText: String
-        if let count = usage.resetCreditsAvailable {
-            let creditLabel = count == 1 ? "reset credit" : "reset credits"
-            resetCreditsText = "\(count) \(creditLabel) available"
-        } else {
-            resetCreditsText = "Reset credit count unavailable"
-        }
-        menu.addItem(.separator())
-        addInformation(NSAttributedString(string: resetCreditsText, attributes: [
-            .font: NSFont.systemFont(ofSize: 13),
-            .foregroundColor: NSColor.labelColor
-        ]), to: menu)
-        let upcomingExpiries = usage.resetCreditExpiries.filter { $0.date > now }.sorted { $0.date < $1.date }
-        for expiry in upcomingExpiries {
-            addInformation(NSAttributedString(string: "Expires \(expiry.formattedDate)", attributes: [
-                .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: NSColor.secondaryLabelColor
+        if provider.hasResetCredits {
+            let resetCreditsText: String
+            if let count = usage.resetCreditsAvailable {
+                let creditLabel = count == 1 ? "reset credit" : "reset credits"
+                resetCreditsText = "\(count) \(creditLabel) available"
+            } else {
+                resetCreditsText = "Reset credit count unavailable"
+            }
+            menu.addItem(.separator())
+            addInformation(NSAttributedString(string: resetCreditsText, attributes: [
+                .font: NSFont.systemFont(ofSize: 13),
+                .foregroundColor: NSColor.labelColor
             ]), to: menu)
+            let upcomingExpiries = usage.resetCreditExpiries.filter { $0.date > now }.sorted { $0.date < $1.date }
+            for expiry in upcomingExpiries {
+                addInformation(NSAttributedString(string: "Expires \(expiry.formattedDate)", attributes: [
+                    .font: NSFont.systemFont(ofSize: 11),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]), to: menu)
+            }
         }
         addActions(to: menu)
         item.menu = menu
@@ -368,7 +396,7 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
         let refreshItem = NSMenuItem(title: "Refresh now", action: #selector(refresh), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
-        let quitItem = NSMenuItem(title: "Quit Codex Usage", action: #selector(quit), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit AI Usage", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
@@ -384,6 +412,6 @@ private struct UsageError: LocalizedError {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-private let delegate = UsageApp()
+private let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
