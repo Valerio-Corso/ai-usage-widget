@@ -41,6 +41,21 @@ private struct QuotaWindow {
         formatter.doesRelativeDateFormatting = true
         return "Resets \(formatter.string(from: resetDate))"
     }
+
+    var urgencyColor: NSColor? {
+        if remaining <= 10 { return .systemRed }
+        if remaining <= 20 { return .systemOrange }
+        return nil
+    }
+
+    func countdown(at now: Date) -> String? {
+        guard let resetDate, resetDate > now else { return nil }
+        let minutes = Int(resetDate.timeIntervalSince(now) / 60)
+        if minutes >= 2880 { return "\(minutes / 1440)d" }
+        if minutes >= 600 { return "\(minutes / 60)h" }
+        if minutes >= 60 { return String(format: "%dh%02d", minutes / 60, minutes % 60) }
+        return "\(max(1, minutes))m"
+    }
 }
 
 private struct ResetCreditExpiry {
@@ -68,6 +83,23 @@ private struct UsageSnapshot {
     let windows: [QuotaWindow]
     let resetCreditsAvailable: Int?
     let resetCreditExpiries: [ResetCreditExpiry]
+    var fetched = Date()
+
+    // Values from a window that has since reset are no longer worth showing.
+    func isCurrent(at now: Date) -> Bool {
+        windows.allSatisfy { $0.resetDate.map { $0 > now } ?? true }
+    }
+}
+
+private enum Layout: String, CaseIterable {
+    case bars, numbers
+
+    static let key = "layout"
+    static var current: Layout {
+        Layout(rawValue: UserDefaults.standard.string(forKey: key) ?? "") ?? .bars
+    }
+
+    var title: String { self == .bars ? "Bars layout" : "Numbers layout" }
 }
 
 private struct Provider {
@@ -89,18 +121,20 @@ private struct Provider {
 private enum ProviderState {
     case loading
     case loaded(UsageSnapshot)
-    case failed(String)
+    case failed(String, last: UsageSnapshot?)
+
+    var usage: UsageSnapshot? {
+        switch self {
+        case .loading: return nil
+        case let .loaded(usage): return usage
+        case let .failed(_, last): return last
+        }
+    }
 }
 
 private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private static let resetCreditAlertsKey = "sentResetCreditExpiryAlerts"
     private static let alertsEnabledKey = "resetCreditAlertsEnabled"
-    private static let valueAttributes: [NSAttributedString.Key: Any] = [
-        .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.black
-    ]
-    private static let labelAttributes: [NSAttributedString.Key: Any] = [
-        .font: NSFont.systemFont(ofSize: 6.5, weight: .medium), .foregroundColor: NSColor.black
-    ]
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let notifications = UNUserNotificationCenter.current()
     private var sentResetCreditAlerts =
@@ -109,6 +143,8 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
     private var states: [String: ProviderState] = [:]
     private var refreshing: Set<String> = []
     private var timer: Timer?
+    private var countdownTimer: Timer?
+    private var appearanceObservation: NSKeyValueObservation?
 
     private var enabledProviders: [Provider] {
         Provider.all.filter { UserDefaults.standard.bool(forKey: $0.enabledKey) }
@@ -117,7 +153,7 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
     private var alertsEnabled: Bool { UserDefaults.standard.bool(forKey: Self.alertsEnabledKey) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        var defaults: [String: Any] = [Self.alertsEnabledKey: true]
+        var defaults: [String: Any] = [Self.alertsEnabledKey: true, Layout.key: Layout.bars.rawValue]
         for provider in Provider.all { defaults[provider.enabledKey] = true }
         UserDefaults.standard.register(defaults: defaults)
         notifications.delegate = self
@@ -129,6 +165,13 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
         refreshNow()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.refreshNow()
+        }
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.render()
+        }
+        // Warning colors need a non-template image, which has to follow the menu bar's appearance itself.
+        appearanceObservation = item.button?.observe(\.effectiveAppearance) { [weak self] _, _ in
+            self?.render()
         }
     }
 
@@ -150,7 +193,9 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
                         self.states[provider.id] = .loaded(usage)
                         self.checkResetCreditExpiries(usage.resetCreditExpiries, for: provider)
                     case let .failure(error):
-                        self.states[provider.id] = .failed(error.localizedDescription)
+                        self.states[provider.id] = .failed(error.localizedDescription,
+                                                           last: (error as? UsageError)?.last
+                                                               ?? self.states[provider.id]?.usage)
                     }
                     self.render()
                 }
@@ -169,6 +214,11 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
             states[provider.id] = nil
             render()
         }
+    }
+
+    @objc private func selectLayout(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(Layout.allCases[sender.tag].rawValue, forKey: Layout.key)
+        render()
     }
 
     @objc private func toggleAlerts() {
@@ -313,11 +363,15 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
             guard !windows.isEmpty else { throw UsageError("No usage windows were returned") }
             let resetCreditsAvailable = json["resetCreditsAvailable"] as? Int
             let expiryData = json["resetCreditExpiries"] as? [[String: Any]] ?? []
-            return .success(UsageSnapshot(
+            let snapshot = UsageSnapshot(
                 windows: windows,
                 resetCreditsAvailable: resetCreditsAvailable,
-                resetCreditExpiries: expiryData.compactMap(ResetCreditExpiry.init)
-            ))
+                resetCreditExpiries: expiryData.compactMap(ResetCreditExpiry.init),
+                fetched: (json["fetchedAt"] as? Double).map(Date.init(timeIntervalSince1970:)) ?? Date()
+            )
+            // A script that could not refresh may still return its last values alongside the reason.
+            if let message = json["error"] as? String { throw UsageError(message, last: snapshot) }
+            return .success(snapshot)
         } catch {
             return .failure(error)
         }
@@ -340,72 +394,107 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
         }
     }
 
-    private func statusImage(for provider: Provider, windows: [QuotaWindow], nextReset: Date?) -> NSImage {
-        let valueAttributes = Self.valueAttributes
-        let periods = windows.map { NSAttributedString(string: $0.compactPeriod, attributes: valueAttributes) }
-        let values = windows.map { NSAttributedString(string: $0.remainingText, attributes: valueAttributes) }
-        let letters = provider.labelLetters.map { NSAttributedString(string: $0, attributes: Self.labelAttributes) }
-        let labelWidth = ceil(letters.map { $0.size().width }.max() ?? 0)
-        let periodWidth = ceil(periods.map { $0.size().width }.max() ?? 0)
-        let valueWidth = ceil(NSAttributedString(string: "100%", attributes: valueAttributes).size().width)
-        let resetParts: [NSAttributedString]
-        if let nextReset {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HH:mm"
-            resetParts = formatter.string(from: nextReset).components(separatedBy: ":").map {
-                NSAttributedString(string: $0, attributes: valueAttributes)
-            }
-        } else {
-            resetParts = []
-        }
-        let periodX = labelWidth + 2
-        let valueX = periodX + periodWidth + 2
-        let resetIcon = resetParts.isEmpty ? nil : NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Next reset")
-        let resetIconX = valueX + valueWidth + 4
-        let resetX = resetIconX + (resetIcon == nil ? 0 : 11)
-        let resetWidth = ceil(resetParts.map { $0.size().width }.max() ?? 0)
-        let width = resetParts.isEmpty ? valueX + valueWidth : resetX + resetWidth
-        let image = NSImage(size: NSSize(width: width, height: 22), flipped: false) { _ in
-            Self.drawLabel(letters, width: labelWidth)
-            for index in windows.indices {
-                let centerY: CGFloat = windows.count == 1 ? 11 : (index == 0 ? 16 : 6)
-                let periodSize = periods[index].size()
-                let valueSize = values[index].size()
-                periods[index].draw(at: NSPoint(x: periodX + periodWidth - periodSize.width,
-                                               y: centerY - periodSize.height / 2))
-                values[index].draw(at: NSPoint(x: valueX + (valueWidth - valueSize.width) / 2,
-                                              y: centerY - valueSize.height / 2))
-            }
-            resetIcon?.draw(in: NSRect(x: resetIconX, y: 6.5, width: 9, height: 9))
-            for (index, part) in resetParts.enumerated() {
-                let size = part.size()
-                let centerY: CGFloat = index == 0 ? 16 : 6
-                part.draw(at: NSPoint(x: resetX + (resetWidth - size.width) / 2,
-                                     y: centerY - size.height / 2))
-            }
-            return true
-        }
-        image.isTemplate = true
-        return image
+    private static func text(_ string: String, size: CGFloat = 10, color: NSColor) -> NSAttributedString {
+        NSAttributedString(string: string, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: size, weight: .medium), .foregroundColor: color
+        ])
     }
 
-    private func placeholderImage(for provider: Provider, text: String) -> NSImage {
-        let letters = provider.labelLetters.map { NSAttributedString(string: $0, attributes: Self.labelAttributes) }
+    private static func labelLetters(for provider: Provider, color: NSColor) -> [NSAttributedString] {
+        provider.labelLetters.map {
+            NSAttributedString(string: $0, attributes: [
+                .font: NSFont.systemFont(ofSize: 6.5, weight: .medium), .foregroundColor: color
+            ])
+        }
+    }
+
+    private func statusImage(for provider: Provider, usage: UsageSnapshot, stale: Bool,
+                             primary: NSColor, now: Date) -> NSImage {
+        let windows = usage.windows
+        let base = stale ? primary.withAlphaComponent(0.45) : primary
+        let dim = base.withAlphaComponent(stale ? 0.3 : 0.6)
+        let color = { (window: QuotaWindow) in stale ? base : window.urgencyColor ?? base }
+        let letters = Self.labelLetters(for: provider, color: base)
+        let labelWidth = ceil(letters.map { $0.size().width }.max() ?? 0)
+        var draws: [() -> Void] = []
+        func place(_ text: NSAttributedString, at x: CGFloat, centerY: CGFloat = 11) {
+            draws.append { text.draw(at: NSPoint(x: x, y: centerY - text.size().height / 2)) }
+        }
+        var x = labelWidth + 3
+        switch Layout.current {
+        case .bars:
+            let barWidth: CGFloat = 22
+            for (index, window) in windows.enumerated() {
+                let y: CGFloat = windows.count == 1 ? 9 : (index == 0 ? 13 : 5)
+                let track = NSRect(x: x, y: y, width: barWidth, height: 4)
+                let fill = NSRect(x: x, y: y, width: max(4, barWidth * CGFloat(window.remaining) / 100), height: 4)
+                let tint = color(window)
+                draws.append {
+                    primary.withAlphaComponent(stale ? 0.15 : 0.3).setFill()
+                    NSBezierPath(roundedRect: track, xRadius: 2, yRadius: 2).fill()
+                    guard window.remaining > 0 else { return }
+                    tint.setFill()
+                    NSBezierPath(roundedRect: fill, xRadius: 2, yRadius: 2).fill()
+                }
+            }
+            x += barWidth + 4
+            if let tightest = windows.min(by: { $0.remaining < $1.remaining }) {
+                let value = Self.text(tightest.remainingText, size: 11, color: color(tightest))
+                place(value, at: x)
+                x += ceil(value.size().width) + 3
+                if !stale, tightest.urgencyColor != nil, let countdown = tightest.countdown(at: now) {
+                    let reset = Self.text(countdown, size: 9, color: color(tightest))
+                    place(reset, at: x)
+                    x += ceil(reset.size().width) + 3
+                }
+            }
+        case .numbers:
+            let periods = windows.map { Self.text($0.compactPeriod, color: dim) }
+            let values = windows.map { Self.text($0.remainingText, color: color($0)) }
+            let resets = windows.map { window in
+                stale ? nil : window.countdown(at: now).map { Self.text($0, color: dim) }
+            }
+            let periodWidth = ceil(periods.map { $0.size().width }.max() ?? 0)
+            let valueX = x + periodWidth + 3
+            let valueWidth = ceil(Self.text("100%", color: base).size().width)
+            let resetX = valueX + valueWidth + 4
+            let resetWidth = ceil(resets.compactMap { $0?.size().width }.max() ?? 0)
+            for index in windows.indices {
+                let centerY: CGFloat = windows.count == 1 ? 11 : (index == 0 ? 16 : 6)
+                place(periods[index], at: x + periodWidth - periods[index].size().width, centerY: centerY)
+                place(values[index], at: valueX + valueWidth - values[index].size().width, centerY: centerY)
+                if let reset = resets[index] { place(reset, at: resetX, centerY: centerY) }
+            }
+            x = (resetWidth > 0 ? resetX + resetWidth : valueX + valueWidth) + 3
+        }
+        if stale {
+            let mark = Self.text("⚠︎", size: 9, color: base)
+            place(mark, at: x)
+            x += ceil(mark.size().width) + 3
+        }
+        let commands = draws
+        return NSImage(size: NSSize(width: x - 3, height: 22), flipped: false) { _ in
+            Self.drawLabel(letters, width: labelWidth)
+            commands.forEach { $0() }
+            return true
+        }
+    }
+
+    private func placeholderImage(for provider: Provider, text: String, color: NSColor) -> NSImage {
+        let letters = Self.labelLetters(for: provider, color: color)
         let mark = NSAttributedString(string: text, attributes: [
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium), .foregroundColor: NSColor.black
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium), .foregroundColor: color
         ])
         let labelWidth = ceil(letters.map { $0.size().width }.max() ?? 0)
         let markSize = mark.size()
-        let image = NSImage(size: NSSize(width: labelWidth + 3 + ceil(markSize.width), height: 22), flipped: false) { _ in
+        return NSImage(size: NSSize(width: labelWidth + 3 + ceil(markSize.width), height: 22), flipped: false) { _ in
             Self.drawLabel(letters, width: labelWidth)
             mark.draw(at: NSPoint(x: labelWidth + 3, y: 11 - markSize.height / 2))
             return true
         }
-        image.isTemplate = true
-        return image
     }
 
-    private func combinedImage(_ parts: [NSImage]) -> NSImage {
+    private func combinedImage(_ parts: [NSImage], template: Bool) -> NSImage {
         let gap: CGFloat = 10
         let width = parts.reduce(0) { $0 + $1.size.width } + gap * CGFloat(parts.count - 1)
         let image = NSImage(size: NSSize(width: width, height: 22), flipped: false) { _ in
@@ -416,7 +505,7 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
             }
             return true
         }
-        image.isTemplate = true
+        image.isTemplate = template
         return image
     }
 
@@ -425,6 +514,12 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
         let now = Date()
         let menu = NSMenu()
         menu.minimumWidth = 270
+        let urgent = providers.contains { provider in
+            guard case let .loaded(usage) = states[provider.id] else { return false }
+            return usage.windows.contains { $0.urgencyColor != nil }
+        }
+        let darkBar = item.button?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let primary: NSColor = urgent && darkBar ? .white : .black
         var images: [NSImage] = []
         var descriptions: [String] = []
         for provider in providers {
@@ -435,19 +530,26 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
             ]), to: menu)
             switch states[provider.id] ?? .loading {
             case .loading:
-                images.append(placeholderImage(for: provider, text: "…"))
+                images.append(placeholderImage(for: provider, text: "…", color: primary))
                 descriptions.append("\(provider.name): checking usage.")
                 addDetail("Checking usage…", to: menu)
-            case let .failed(message):
-                images.append(placeholderImage(for: provider, text: "⚠︎"))
+            case let .failed(message, last):
                 descriptions.append("\(provider.name): \(message)")
                 addDetail(message, to: menu)
+                if let last, last.isCurrent(at: now) {
+                    images.append(statusImage(for: provider, usage: last, stale: true, primary: primary, now: now))
+                    let updated = DateFormatter.localizedString(from: last.fetched, dateStyle: .none, timeStyle: .short)
+                    addDetail("Last updated \(updated)", to: menu)
+                    addUsage(last, of: provider, to: menu, now: now)
+                } else {
+                    images.append(placeholderImage(for: provider, text: "⚠︎", color: primary))
+                }
             case let .loaded(usage):
                 let nextReset = usage.windows.compactMap { window -> (window: QuotaWindow, date: Date)? in
                     guard let date = window.resetDate, date > now else { return nil }
                     return (window, date)
                 }.min { $0.date < $1.date }
-                images.append(statusImage(for: provider, windows: usage.windows, nextReset: nextReset?.date))
+                images.append(statusImage(for: provider, usage: usage, stale: false, primary: primary, now: now))
                 var description = "\(provider.name) Usage. "
                 if let nextReset {
                     let formatter = DateFormatter()
@@ -466,7 +568,7 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
             setStatusTitle("AI Usage")
             addDetail("No services tracked. Turn one on in Settings.", to: menu)
         } else {
-            let image = combinedImage(images)
+            let image = combinedImage(images, template: !urgent)
             item.length = image.size.width + 8
             item.button?.title = ""
             item.button?.attributedTitle = NSAttributedString(string: "")
@@ -557,6 +659,14 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
             menu.addItem(toggle)
         }
         menu.addItem(.separator())
+        for (index, layout) in Layout.allCases.enumerated() {
+            let option = NSMenuItem(title: layout.title, action: #selector(selectLayout), keyEquivalent: "")
+            option.target = self
+            option.tag = index
+            option.state = Layout.current == layout ? .on : .off
+            menu.addItem(option)
+        }
+        menu.addItem(.separator())
         let alerts = NSMenuItem(title: "Reset credit expiry alerts", action: #selector(toggleAlerts), keyEquivalent: "")
         alerts.target = self
         alerts.state = alertsEnabled ? .on : .off
@@ -572,7 +682,11 @@ private final class UsageApp: NSObject, NSApplicationDelegate, UNUserNotificatio
 
 private struct UsageError: LocalizedError {
     let message: String
-    init(_ message: String) { self.message = message }
+    var last: UsageSnapshot?
+    init(_ message: String, last: UsageSnapshot? = nil) {
+        self.message = message
+        self.last = last
+    }
     var errorDescription: String? { message }
 }
 
